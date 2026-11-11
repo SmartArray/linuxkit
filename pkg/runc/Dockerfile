@@ -1,19 +1,20 @@
 # Dockerfile to build linuxkit/runc for linuxkit
-FROM linuxkit/alpine:7f3944798557de5518a56e3437d7ed982701f224 as alpine
+FROM linuxkit/alpine:e9313150d2cf07ad92b0adb86799dedd9a0476e4 as alpine
 RUN \
   apk add \
   bash \
   gcc \
   git \
-  go \
   libc-dev \
   libseccomp-dev \
   libseccomp-static \
   linux-headers \
   make \
   && true
-ENV GOPATH=/go PATH=$PATH:/go/bin
-ENV RUNC_COMMIT=v1.3.3
+ENV GOPATH=/go PATH=$PATH:/go/bin GO111MODULE=on GOFLAGS=-mod=vendor
+COPY --from=golang:1.26.11-alpine3.23@sha256:db99415e2625ce0ee03eed09edf7f32ae8c58dc399f28cc602a87fe7238119e4 /usr/local/go /usr/local/go
+ENV PATH=/usr/local/go/bin:$PATH GOTOOLCHAIN=local
+ENV RUNC_COMMIT=491b69bab9fa206b984fb26ba07d3110d62e671f
 RUN mkdir -p $GOPATH/src/github.com/opencontainers && \
   cd $GOPATH/src/github.com/opencontainers && \
   git clone https://github.com/opencontainers/runc.git

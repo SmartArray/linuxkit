@@ -18,6 +18,7 @@ package docker
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -150,6 +151,18 @@ func (p dockerPusher) push(ctx context.Context, desc ocispec.Descriptor, ref str
 		} else if resp.StatusCode != http.StatusNotFound {
 			err := remoteserrors.NewUnexpectedStatusErr(resp)
 			log.G(ctx).WithField("resp", resp).WithField("body", string(err.(remoteserrors.ErrUnexpectedStatus).Body)).Debug("unexpected response")
+			// A HEAD 403 carries no body, so issue a follow-up GET to the
+			// same URL to surface the registry's error details for diagnostics.
+			if resp.StatusCode == http.StatusForbidden && req.method == http.MethodHead {
+				err = withGETErrorBody(ctx, err, resp, func() (*http.Response, error) {
+					getReq := p.request(host, http.MethodGet, existCheck...)
+					getReq.header.Set("Accept", strings.Join([]string{desc.MediaType, `*/*`}, ", "))
+					if addErr := getReq.addNamespace(p.refspec.Hostname()); addErr != nil {
+						return nil, addErr
+					}
+					return getReq.doWithRetries(ctx, nil)
+				})
+			}
 			resp.Body.Close()
 			return nil, err
 		}
@@ -178,17 +191,21 @@ func (p dockerPusher) push(ctx context.Context, desc ocispec.Descriptor, ref str
 			// query and send the request again.
 			resp, err = preq.doWithRetries(pctx, nil)
 			if err != nil {
-				return nil, err
+				if !errors.Is(err, ErrInvalidAuthorization) {
+					return nil, fmt.Errorf("pushing with mount from %s: %w", fromRepo, err)
+				}
+				log.G(ctx).Debugf("failed to push with mount from repository %s: %v", fromRepo, err)
 			}
+			if resp != nil {
+				switch resp.StatusCode {
+				case http.StatusUnauthorized:
+					log.G(ctx).Debugf("failed to mount from repository %s, not authorized", fromRepo)
 
-			switch resp.StatusCode {
-			case http.StatusUnauthorized:
-				log.G(ctx).Debugf("failed to mount from repository %s", fromRepo)
-
-				resp.Body.Close()
-				resp = nil
-			case http.StatusCreated:
-				mountedFrom = path.Join(p.refspec.Hostname(), fromRepo)
+					resp.Body.Close()
+					resp = nil
+				case http.StatusCreated:
+					mountedFrom = path.Join(p.refspec.Hostname(), fromRepo)
+				}
 			}
 		}
 
@@ -477,13 +494,15 @@ func (pw *pushWriter) Digest() digest.Digest {
 
 func (pw *pushWriter) Commit(ctx context.Context, size int64, expected digest.Digest, opts ...content.Opt) error {
 	// Check whether read has already thrown an error
-	if _, err := pw.pipe.Write([]byte{}); err != nil && !errors.Is(err, io.ErrClosedPipe) {
-		return fmt.Errorf("pipe error before commit: %w", err)
+	if pw.pipe != nil {
+		if _, err := pw.pipe.Write([]byte{}); err != nil && !errors.Is(err, io.ErrClosedPipe) {
+			return fmt.Errorf("pipe error before commit: %w", err)
+		}
+		if err := pw.pipe.Close(); err != nil {
+			return err
+		}
 	}
 
-	if err := pw.pipe.Close(); err != nil {
-		return err
-	}
 	// TODO: timeout waiting for response
 	var resp *http.Response
 	select {
@@ -542,6 +561,52 @@ func (pw *pushWriter) Truncate(size int64) error {
 	// TODO: if blob close request and start new request at offset
 	// TODO: always error on manifest
 	return errors.New("cannot truncate remote upload")
+}
+
+// withGETErrorBody enriches originalErr, produced from a bodyless HEAD
+// response, with the error body from a follow-up GET to the same URL. HEAD
+// responses carry no body, so a 403 only surfaces its status code; a GET
+// returns the registry's error details (e.g. "key vault access denied", IP
+// restrictions) that explain the failure.
+//
+// The GET body is only used when the GET also returns 403, so the enriched
+// error's status and body stay consistent. In that case the original HEAD
+// request's method and status are preserved and only the body is borrowed from
+// the GET; any other outcome (GET failed, or returned a different status)
+// leaves originalErr untouched.
+func withGETErrorBody(ctx context.Context, originalErr error, headResp *http.Response, doGET func() (*http.Response, error)) error {
+	getResp, err := doGET()
+	if err != nil {
+		log.G(ctx).WithError(err).Debug("failed to retrieve error body with GET fallback")
+		return originalErr
+	}
+	defer getResp.Body.Close()
+
+	if getResp.StatusCode != http.StatusForbidden {
+		log.G(ctx).WithFields(log.Fields{
+			"head_status": headResp.Status,
+			"get_status":  getResp.Status,
+		}).Debug("ignoring GET fallback response with different status")
+		return originalErr
+	}
+
+	// Preserve the original HEAD request's method and status and borrow only
+	// the body from the GET, so the error still reflects the request the caller
+	// actually made.
+	enriched := *headResp
+	enriched.Body = getResp.Body
+	retErr := remoteserrors.NewUnexpectedStatusErr(&enriched)
+
+	// Decode the registry error body inline and join it to the status error:
+	// the joined message surfaces the diagnostic details while the body stays
+	// out of the status error's own message.
+	if rerr, ok := retErr.(remoteserrors.ErrUnexpectedStatus); ok && len(rerr.Body) > 0 {
+		var registryErr Errors
+		if jerr := json.Unmarshal(rerr.Body, &registryErr); jerr == nil && registryErr.Len() > 0 {
+			retErr = errors.Join(rerr, registryErr)
+		}
+	}
+	return retErr
 }
 
 func requestWithMountFrom(req *request, mount, from string) *request {

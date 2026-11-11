@@ -1,12 +1,13 @@
 # Dockerfile to build linuxkit/init for linuxkit
-FROM linuxkit/containerd-dev:3cb13cb53e9901cd9e8a8c087e4599b9bdbe8931 AS containerd-dev
-FROM linuxkit/alpine:7f3944798557de5518a56e3437d7ed982701f224 AS build
+FROM linuxkit/alpine:e9313150d2cf07ad92b0adb86799dedd9a0476e4 AS build
 RUN apk add --no-cache --initdb alpine-baselayout make gcc musl-dev git linux-headers
 
 ADD usermode-helper.c ./
 RUN LDFLAGS=-static CFLAGS=-Werror make usermode-helper
 
-RUN apk add --no-cache go musl-dev
+RUN apk add --no-cache musl-dev
+COPY --from=golang:1.26.11-alpine3.23@sha256:db99415e2625ce0ee03eed09edf7f32ae8c58dc399f28cc602a87fe7238119e4 /usr/local/go /usr/local/go
+ENV PATH=/usr/local/go/bin:$PATH GOTOOLCHAIN=local
 ENV GOPATH=/go PATH=$PATH:/go/bin
 ARG GOPKGVERSION
 ENV ldflags="-X main.Version=$GOPKGVERSION"
@@ -20,16 +21,17 @@ RUN go-compile.sh /go/src/cmd/rc.init
 # this makes sure that the multi stage build copies as a symlink
 RUN mkdir /tmp/bin && cd /tmp/bin/ && cp /go/bin/rc.init . && ln -s rc.init rc.shutdown
 
-COPY --from=containerd-dev /go/src/github.com/containerd/containerd $GOPATH/src/github.com/containerd/containerd
-RUN cd /go/src/cmd/service && ./skanky-vendor.sh $GOPATH/src/github.com/containerd/containerd
 RUN go-compile.sh /go/src/cmd/service
 
 # volumes link to start
 RUN mkdir -p /etc/init.d && ln -s /usr/bin/service /etc/init.d/005-volumes
 
-FROM linuxkit/alpine:7f3944798557de5518a56e3437d7ed982701f224 AS mirror
-RUN mkdir -p /out/etc/apk && cp -r /etc/apk/* /out/etc/apk/
-RUN apk add --no-cache --initdb -p /out alpine-baselayout busybox musl
+FROM linuxkit/alpine:e9313150d2cf07ad92b0adb86799dedd9a0476e4 AS mirror
+RUN mkdir -p /out/etc/apk && cp -r /etc/apk/* /out/etc/apk/ && \
+    printf '%s\n' 'https://dl-cdn.alpinelinux.org/alpine/v3.23/main' > /out/etc/apk/repositories
+RUN apk add --no-cache --initdb -p /out \
+    alpine-baselayout=3.7.2-r0 alpine-baselayout-data=3.7.2-r0 \
+    busybox=1.37.0-r30 busybox-binsh=1.37.0-r30 musl=1.2.5-r24
 
 # Add /etc/ssl/certs so it can be bind-mounted into metadata package
 RUN mkdir -p /out/etc/ssl/certs
